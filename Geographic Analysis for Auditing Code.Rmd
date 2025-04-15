@@ -1,0 +1,420 @@
+---
+title: "Geographic Analysis for Auditing"
+author: "Kayley Smiley"
+date: "05-05-2025"
+output: html_document
+---
+
+### Load Packages
+
+```{r, warning = FALSE, message = FALSE}
+#load packages
+#install before loading if not already installed with install.packages()
+
+library(tidyverse) #for data cleaning and manipulation
+library(sf) #for working with spatial data
+library(ggplot2) #for plotting
+library(ggspatial) #framework for interacting with spatial data with ggplot2
+library(smerc) #for cluster detection
+library(biscale) #for bivariate choropleth map
+library(cowplot) #for bivariate choropleth map
+```
+
+
+### Read & Prep Data
+
+```{r}
+#read in the NYC EMS incident data (stored in github)
+df <- readRDS(url("https://github.com/kayley-smiley/ALGA_Presentation/raw/refs/heads/main/EMS_Incident_Dispatch_Data.rds"))
+
+#read in the NYC city council district file (stored in github)
+shape <- readRDS(url("https://github.com/kayley-smiley/ALGA_Presentation/raw/refs/heads/main/shapefile.rds"))
+
+#read in the demographic data (stored in github)
+ACS_data <- readRDS(url("https://github.com/kayley-smiley/ALGA_Presentation/raw/refs/heads/main/ACS_data.rds"))
+
+#read in the fire station data (stored in github)
+fire_stations <- readRDS(url("https://github.com/kayley-smiley/ALGA_Presentation/raw/refs/heads/main/fire_station_data.rds"))
+```
+
+
+```{r}
+#convert shape file to an sf object for spatial analysis
+shape <- st_as_sf(shape, wkt = "the_geom")
+st_crs(shape) <- 4326
+
+#view the study area
+plot(st_geometry(shape))
+```
+
+
+```{r}
+#for the analysis, we need calls with city council districts and response times
+#drop any rows that do not have these two things
+df <- drop_na(df, any_of(c("CITYCOUNCILDISTRICT", "INCIDENT_TRAVEL_TM_SECONDS_QY")))
+
+#create a variable that indicates if a call has a "compliant" response time
+#using a goal of 10 minutes (600 seconds) here
+df$compliant_travel_time <- df$INCIDENT_TRAVEL_TM_SECONDS_QY <= (60 * 10)
+```
+
+
+```{r}
+#prep the demographic data for mapping by merging it with the shape information
+ACS_shape <- merge(ACS_data, shape, by.x = "CounDist",
+                             by.y = "CounDist", all.x = TRUE)
+ACS_shape <- st_as_sf(ACS_shape, sf_column_name = "the_geom")
+
+ACS_shape <- cbind(st_coordinates(st_centroid(st_geometry(ACS_shape))), ACS_shape)
+```
+
+
+
+```{r}
+#create a data frame that's grouped by city council district and contains
+#the response count, average response time, and compliant response count
+responses_grouped <- df %>%
+  group_by(CITYCOUNCILDISTRICT) %>%
+  summarise(response_count = n(),
+            avg_response_time = mean(INCIDENT_TRAVEL_TM_SECONDS_QY),
+            compliant_count = sum(compliant_travel_time))
+
+#calculate the non_compliant count and proportion
+responses_grouped$non_compliant_count <- responses_grouped$response_count - responses_grouped$compliant_count
+responses_grouped$non_comp_prop <- responses_grouped$non_compliant_count/responses_grouped$response_count
+
+
+#merge this with the shape
+responses_grouped <- merge(responses_grouped, shape, by.x = "CITYCOUNCILDISTRICT",
+                             by.y = "CounDist", all.x = TRUE)
+
+#convert to an sf object for mapping
+responses_grouped <- st_as_sf(responses_grouped, sf_column_name = "the_geom")
+
+#add the region centroids as a variable
+#these will be used for cluster detection later on
+responses_grouped <- cbind(st_coordinates(st_centroid(st_geometry(responses_grouped))), responses_grouped)
+```
+
+
+### Planning Maps
+
+#### Demographic Maps
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(ACS_shape[which.max(ACS_shape$Pop85plP),]), st_drop_geometry(ACS_shape[which.min(ACS_shape$Pop85plP),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of proportion residents 85 or older
+ggplot(ACS_shape) +
+  geom_sf(aes(fill = Pop85plP)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 16),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Prop.", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Prop.", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Proportion of Residents 85 and Older", subtitle = "by City Council District, American Community Survey Data",
+       fill = "Proportion") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+
+
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(ACS_shape[which.max(ACS_shape$MdHHIncE),]), st_drop_geometry(ACS_shape[which.min(ACS_shape$MdHHIncE),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of median household income
+ggplot(ACS_shape) +
+  geom_sf(aes(fill = MdHHIncE)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 16),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Income", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Income", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Median Household Income", subtitle = "by City Council District, American Community Survey Data",
+       fill = "Income") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+#### Response Count Map
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(responses_grouped[which.max(responses_grouped$response_count),]), st_drop_geometry(responses_grouped[which.min(responses_grouped$response_count),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of response counts
+ggplot(responses_grouped) +
+  geom_sf(aes(fill = response_count)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Count", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Count", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Emergency Medical Response Count", subtitle = "by City Council District, 2024",
+       fill = "Count") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+
+#### Average Response Time Map
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(responses_grouped[which.max(responses_grouped$avg_response_time),]), st_drop_geometry(responses_grouped[which.min(responses_grouped$avg_response_time),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of average response time
+ggplot(responses_grouped) +
+  geom_sf(aes(fill = avg_response_time)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Time", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Time", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Average Response Time", subtitle = "by City Council District, 2024",
+       fill = "Time (sec.)") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+#### Count of Non-Compliant Response Times Map
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(responses_grouped[which.max(responses_grouped$non_compliant_count),]), st_drop_geometry(responses_grouped[which.min(responses_grouped$non_compliant_count),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of number of non-compliant responses
+ggplot(responses_grouped) +
+  geom_sf(aes(fill = non_compliant_count)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Count", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Count", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Non-Compliant Response Count", subtitle = "by City Council District, 2024",
+       fill = "Count") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+
+
+#### Proportion of Non-Compliant Response Times Map
+
+```{r}
+#create a combined data frame with the min and max coordinates
+min_max_coords <- rbind(st_drop_geometry(responses_grouped[which.max(responses_grouped$non_comp_prop),]), st_drop_geometry(responses_grouped[which.min(responses_grouped$non_comp_prop),]))
+
+#add a variable indicating which is the min and which is the max
+min_max_coords$indicator <- c("Max", "Min")
+
+min_max_coords
+```
+
+
+```{r}
+#plot of proportion of non-compliant responses
+ggplot(responses_grouped) +
+  geom_sf(aes(fill = non_comp_prop)) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  geom_point(data = min_max_coords, aes(x = X, y = Y, shape = indicator, color = indicator), size = 3) +
+  scale_shape_manual(name = "Min/Max Prop.", values = c("Max" = 8, "Min" = 8)) +
+  scale_color_manual(name = "Min/Max Prop.", values = c("Max" = "lightgrey", "Min" = "black")) +
+  labs(title = "Proportion of Non-Compliant Responses", subtitle = "by City Council District, 2024",
+       fill = "Proportion") +
+  colorspace::scale_fill_continuous_sequential(palette = "Rocket") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+
+
+### Fieldwork Maps
+
+#### Cluster Map
+
+```{r}
+#create a data frame that contains just the district centroids
+coords <- with(responses_grouped, cbind(X, Y))
+```
+
+```{r}
+#clusters of long response times
+
+#cases: the number of long response times
+#pop: the total number of "responses"
+#nsim: the number of simulations used to calculate significance for the clusters
+#alpha: significance level
+#ubpop: a limit on how big the clusters can be (20% of the total number of "responses")
+#type: distribution used to model the data
+cluster_results <- scan.test(coords = coords, cases = responses_grouped$non_compliant_count, 
+                     pop = responses_grouped$response_count, nsim = 999, alpha = 0.05,
+                     ubpop = 0.2, type = "poisson")
+```
+
+```{r}
+#add a variable to the responses_grouped data frame that indicates which districts
+#are in clusters
+responses_grouped$cluster_label <- rep(NA, nrow(responses_grouped))
+responses_grouped$cluster_label[clusters(cluster_results)[[1]]] <- "Cluster 1"
+responses_grouped$cluster_label[clusters(cluster_results)[[2]]] <- "Cluster 2"
+responses_grouped$cluster_label[clusters(cluster_results)[[3]]] <- "Cluster 3"
+responses_grouped$cluster_label[clusters(cluster_results)[[4]]] <- "Cluster 4"
+responses_grouped$cluster_label[clusters(cluster_results)[[5]]] <- "Cluster 5"
+
+
+color_mapping <- c("Cluster 1" = "#4B0055",
+                   "Cluster 2" = "#006290",
+                   "Cluster 3" = "#00AC8E",
+                   "Cluster 4" = "#A6DA42",
+                   "Cluster 5" = "#FDE333")
+
+responses_grouped$cluster_label <- factor(responses_grouped$cluster_label, levels = names(color_mapping))
+```
+
+
+```{r}
+ggplot(responses_grouped) + 
+  geom_sf(aes(fill = cluster_label), color = "black") +
+  scale_fill_manual(values = color_mapping, na.value = "white", name = "Clusters",
+                    na.translate = FALSE) + 
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  labs(title = "Clusters of Non-Compliant Responses", subtitle = "by City Council District, 2024",
+       fill = "Clusters") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+#### Clusters with Fire Stations Map
+
+
+```{r}
+ggplot(responses_grouped) + 
+  geom_sf(aes(fill = cluster_label), color = "black") +
+  scale_fill_manual(values = color_mapping, na.value = "white", name = "Clusters",
+                    na.translate = FALSE) + 
+  geom_sf(data = fire_stations, aes(color = label, shape = label)) + 
+  scale_shape_manual(name = "Fire Stations", values = c("Station" = 16)) +
+  scale_color_manual(name = "Fire Stations", values = c("Station" = "darkgrey")) +
+  theme_void() + 
+    theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12)) +
+  labs(title = "Clusters of Non-Compliant Responses", subtitle = "by City Council District, 2024") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+```
+
+
+#### Bivariate Choropleth Map
+
+```{r}
+#merge the ACS_shape data frame with the responses_grouped data frame
+bivariate_df <- merge(ACS_shape[, c("CounDist", "Pop_1E", "Pop85plP", "MdHHIncE")], 
+                   st_drop_geometry(responses_grouped), by.x = "CounDist",
+                             by.y = "CITYCOUNCILDISTRICT", all.x = TRUE)
+```
+
+
+
+```{r}
+bivariate_df$inc_resp_class <- bi_class(bivariate_df, 
+                                             x = avg_response_time, y = MdHHIncE, 
+                                             style = "quantile", dim = 3)$bi_class
+```
+
+
+
+```{r}
+#create legend
+legend <- bi_legend(pal = "BlueYl",
+                    dim = 3,
+                    xlab = "Time",
+                    ylab = "Income",
+                    size = 7,
+                    arrows = FALSE)
+
+#create plot
+income_response_map <- ggplot() + 
+  geom_sf(data = bivariate_df, mapping = aes(fill = inc_resp_class), show.legend = FALSE, 
+          color = "white") +
+  bi_scale_fill(pal = "BlueYl", dim = 3) +
+  theme_void() + 
+  theme(plot.title = element_text(face = "bold.italic", size = 20),
+        plot.subtitle = element_text(face = "italic", size = 18),
+        legend.title = element_text(size = 12)) +
+  labs(title = "Median Income & Response Time", subtitle = "by City Council District, 2024") +
+  annotate("segment", x = -Inf, xend = Inf, y = Inf, yend = Inf, color = "black", linewidth = 1)
+
+#put map and legend together
+ggdraw() +
+  draw_plot(income_response_map, 0, 0, 1, 1) +
+   draw_plot(legend, 0.2, 0.6, 0.2, 0.2)
+```
+
+
